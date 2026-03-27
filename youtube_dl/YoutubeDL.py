@@ -357,7 +357,7 @@ class YoutubeDL(object):
 
     _NUMERIC_FIELDS = set((
         'width', 'height', 'tbr', 'abr', 'asr', 'vbr', 'fps', 'filesize', 'filesize_approx',
-        'timestamp', 'upload_year', 'upload_month', 'upload_day',
+        'timestamp', 'upload_year', 'upload_month', 'upload_day', 'available_at',
         'duration', 'view_count', 'like_count', 'dislike_count', 'repost_count',
         'average_rating', 'comment_count', 'age_limit',
         'start_time', 'end_time',
@@ -540,10 +540,14 @@ class YoutubeDL(object):
         """Print message to stdout if not in quiet mode."""
         return self.to_stdout(message, skip_eol, check_quiet=True)
 
-    def _write_string(self, s, out=None):
+    def _write_string(self, s, out=None, only_once=False, _cache=set()):
+        if only_once and s in _cache:
+            return
         write_string(s, out=out, encoding=self.params.get('encoding'))
+        if only_once:
+            _cache.add(s)
 
-    def to_stdout(self, message, skip_eol=False, check_quiet=False):
+    def to_stdout(self, message, skip_eol=False, check_quiet=False, only_once=False):
         """Print message to stdout if not in quiet mode."""
         if self.params.get('logger'):
             self.params['logger'].debug(message)
@@ -552,9 +556,9 @@ class YoutubeDL(object):
             terminator = ['\n', ''][skip_eol]
             output = message + terminator
 
-            self._write_string(output, self._screen_file)
+            self._write_string(output, self._screen_file, only_once=only_once)
 
-    def to_stderr(self, message):
+    def to_stderr(self, message, only_once=False):
         """Print message to stderr."""
         assert isinstance(message, compat_str)
         if self.params.get('logger'):
@@ -562,7 +566,7 @@ class YoutubeDL(object):
         else:
             message = self._bidi_workaround(message)
             output = message + '\n'
-            self._write_string(output, self._err_file)
+            self._write_string(output, self._err_file, only_once=only_once)
 
     def to_console_title(self, message):
         if not self.params.get('consoletitle', False):
@@ -641,18 +645,11 @@ class YoutubeDL(object):
             raise DownloadError(message, exc_info)
         self._download_retcode = 1
 
-    def report_warning(self, message, only_once=False, _cache={}):
+    def report_warning(self, message, only_once=False):
         '''
         Print the message to stderr, it will be prefixed with 'WARNING:'
         If stderr is a tty file the 'WARNING:' will be colored
         '''
-        if only_once:
-            m_hash = hash((self, message))
-            m_cnt = _cache.setdefault(m_hash, 0)
-            _cache[m_hash] = m_cnt + 1
-            if m_cnt > 0:
-                return
-
         if self.params.get('logger') is not None:
             self.params['logger'].warning(message)
         else:
@@ -663,7 +660,7 @@ class YoutubeDL(object):
             else:
                 _msg_header = 'WARNING:'
             warning_message = '%s %s' % (_msg_header, message)
-            self.to_stderr(warning_message)
+            self.to_stderr(warning_message, only_once=only_once)
 
     def report_error(self, message, *args, **kwargs):
         '''
@@ -676,6 +673,16 @@ class YoutubeDL(object):
             _msg_header = 'ERROR:'
         kwargs['message'] = '%s %s' % (_msg_header, message)
         self.trouble(*args, **kwargs)
+
+    def write_debug(self, message, only_once=False):
+        '''Log debug message or Print message to stderr'''
+        if not self.params.get('verbose', False):
+            return
+        message = '[debug] {0}'.format(message)
+        if self.params.get('logger'):
+            self.params['logger'].debug(message)
+        else:
+            self.to_stderr(message, only_once)
 
     def report_unscoped_cookies(self, *args, **kwargs):
         # message=None, tb=False, is_error=False
@@ -2397,60 +2404,52 @@ class YoutubeDL(object):
         return res
 
     def _format_note(self, fdict):
-        res = ''
-        if fdict.get('ext') in ['f4f', 'f4m']:
-            res += '(unsupported) '
-        if fdict.get('language'):
-            if res:
-                res += ' '
-            res += '[%s] ' % fdict['language']
-        if fdict.get('format_note') is not None:
-            res += fdict['format_note'] + ' '
-        if fdict.get('tbr') is not None:
-            res += '%4dk ' % fdict['tbr']
+
+        def simplified_codec(f, field):
+            assert field in ('acodec', 'vcodec')
+            codec = f.get(field)
+            return (
+                'unknown' if not codec
+                else '.'.join(codec.split('.')[:4]) if codec != 'none'
+                else 'images' if field == 'vcodec' and f.get('acodec') == 'none'
+                else None if field == 'acodec' and f.get('vcodec') == 'none'
+                else 'audio only' if field == 'vcodec'
+                else 'video only')
+
+        res = join_nonempty(
+            fdict.get('ext') in ('f4f', 'f4m') and '(unsupported)',
+            fdict.get('language') and ('[%s]' % (fdict['language'],)),
+            fdict.get('format_note') is not None and fdict['format_note'],
+            fdict.get('tbr') is not None and ('%4dk' % fdict['tbr']),
+            delim=' ')
+        res = [res] if res else []
         if fdict.get('container') is not None:
-            if res:
-                res += ', '
-            res += '%s container' % fdict['container']
-        if (fdict.get('vcodec') is not None
-                and fdict.get('vcodec') != 'none'):
-            if res:
-                res += ', '
-            res += fdict['vcodec']
-            if fdict.get('vbr') is not None:
-                res += '@'
+            res.append('%s container' % (fdict['container'],))
+        if fdict.get('vcodec') not in (None, 'none'):
+            codec = simplified_codec(fdict, 'vcodec')
+            if codec and fdict.get('vbr') is not None:
+                codec += '@'
         elif fdict.get('vbr') is not None and fdict.get('abr') is not None:
-            res += 'video@'
-        if fdict.get('vbr') is not None:
-            res += '%4dk' % fdict['vbr']
+            codec = 'video@'
+        else:
+            codec = None
+        codec = join_nonempty(codec, fdict.get('vbr') is not None and ('%4dk' % fdict['vbr']))
+        if codec:
+            res.append(codec)
         if fdict.get('fps') is not None:
-            if res:
-                res += ', '
-            res += '%sfps' % fdict['fps']
-        if fdict.get('acodec') is not None:
-            if res:
-                res += ', '
-            if fdict['acodec'] == 'none':
-                res += 'video only'
-            else:
-                res += '%-5s' % fdict['acodec']
-        elif fdict.get('abr') is not None:
-            if res:
-                res += ', '
-            res += 'audio'
-        if fdict.get('abr') is not None:
-            res += '@%3dk' % fdict['abr']
-        if fdict.get('asr') is not None:
-            res += ' (%5dHz)' % fdict['asr']
+            res.append('%sfps' % (fdict['fps'],))
+        codec = (
+            simplified_codec(fdict, 'acodec') if fdict.get('acodec') is not None
+            else 'audio' if fdict.get('abr') is not None else None)
+        if codec:
+            res.append(join_nonempty(
+                '%-4s' % (codec + (('@%3dk' % fdict['abr']) if fdict.get('abr') else ''),),
+                fdict.get('asr') and '(%5dHz)' % fdict['asr'], delim=' '))
         if fdict.get('filesize') is not None:
-            if res:
-                res += ', '
-            res += format_bytes(fdict['filesize'])
+            res.append(format_bytes(fdict['filesize']))
         elif fdict.get('filesize_approx') is not None:
-            if res:
-                res += ', '
-            res += '~' + format_bytes(fdict['filesize_approx'])
-        return res
+            res.append('~' + format_bytes(fdict['filesize_approx']))
+        return ', '.join(res)
 
     def list_formats(self, info_dict):
         formats = info_dict.get('formats', [info_dict])
@@ -2514,7 +2513,7 @@ class YoutubeDL(object):
                 self.get_encoding()))
         write_string(encoding_str, encoding=None)
 
-        writeln_debug = lambda *s: self._write_string('[debug] %s\n' % (''.join(s), ))
+        writeln_debug = lambda *s: self.write_debug(''.join(s))
         writeln_debug('youtube-dl version ', __version__)
         if _LAZY_LOADER:
             writeln_debug('Lazy loading extractors enabled')
